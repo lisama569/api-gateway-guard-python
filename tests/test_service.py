@@ -86,8 +86,8 @@ class _CountingStore(IdempotencyStore):
         self._count_lock = threading.Lock()
         self.all_claimed = threading.Event()
 
-    def claim(self, key, fingerprint):
-        claim = super().claim(key, fingerprint)
+    def claim(self, key, fingerprint, **scope):
+        claim = super().claim(key, fingerprint, **scope)
         with self._count_lock:
             self._count += 1
             if self._count >= self._expected:

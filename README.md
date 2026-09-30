@@ -1,74 +1,128 @@
 # API Gateway Guard (Python)
 
-在现有 FastAPI 服务之上实现的本地可复现 API 网关治理层，覆盖三项能力：
+在现有 FastAPI 服务之上实现的本地可复现 API 网关治理层，覆盖三条链路：
 
-- **多版本接口共存**：版本间不兼容的请求被明确拒绝，错误可区分。
-- **按调用方限流**：并发下配额准确，超限返回可判断重试时机的信息。
-- **幂等处理**：重复请求不重复触发副作用，处理中 / 已完成 / 冲突可区分，失败可安全重试。
+- **多版本接口共存与版本生命周期**：版本可处于正常提供 / 已废弃但仍可用 / 已停止提供，
+  缺失、格式非法、不认识、已停用、请求体不兼容各有可区分结论。
+- **按调用方 × 接口版本组合生效的配额**：同一调用方不同版本额度独立，不同调用方互不影响；
+  支持版本统一额度与特定调用方覆盖，并发与窗口切换下配额严格准确。
+- **跨版本隔离的幂等处理**：幂等作用域为 `(idempotency_key, caller, version)`，
+  换版本或换调用方不回放旧结果、不误判冲突；处理中 / 已完成 / 冲突可区分，失败可安全重试。
 
 ## 结构
 
 ```
 gateway/
-  errors.py       # 统一错误码 GatewayError / ErrorCode
-  versioning.py   # VersionRegistry：版本注册与兼容校验
-  ratelimit.py    # SlidingWindowRateLimiter：按 caller 的滑动窗口限流
-  idempotency.py  # IdempotencyStore：幂等键状态机
+  errors.py       # 统一错误码 GatewayError / ErrorCode（含结构化 details）
+  versioning.py   # VersionRegistry：生命周期解析 + 兼容校验
+  ratelimit.py    # SlidingWindowRateLimiter（按 caller，旧）
+                  # ScopedSlidingWindowRateLimiter + QuotaPolicy（按 caller×version）
+  idempotency.py  # IdempotencyStore：按 (key, caller, version) 隔离的状态机
   service.py      # GatewayService：按固定顺序组合三者
 main.py           # FastAPI 入口，错误码 -> HTTP 状态映射
-tests/            # 单元与并发测试
+tests/            # 单元、端到端与并发测试
 ```
 
-处理顺序固定为：**版本校验 → 限流 → 幂等申领 → 执行业务 → 完成/失败登记**。
-任一环节拒绝都不会进入后续环节（版本不兼容不消耗配额、不占用幂等键）。
+处理顺序固定为：**版本生命周期解析 → 请求体兼容校验 → 作用域配额 → 作用域幂等申领
+→ 执行业务 → 完成/失败登记**。任一环节拒绝都不会进入后续环节
+（版本被停用/不兼容不消耗配额、不占用幂等键）。
 
-## 版本兼容规则
+## 版本生命周期规则
 
-- 请求必须显式声明版本；未注册的版本拒绝为 `UNSUPPORTED_VERSION`（HTTP 400）。
-- 请求体必须包含该版本的全部必填字段，缺失拒绝为 `INCOMPATIBLE_VERSION`（HTTP 422）。
-- 请求体不得携带该版本已移除的字段，携带拒绝为 `INCOMPATIBLE_VERSION`（HTTP 422）。
-- 校验只针对请求自己声明的版本：旧版本请求**不会**被静默路由到新版本，
-  也不会因形状恰好匹配旧版本而被错误接受。
+每个版本注册时声明一种状态：
 
-内置示例：`v1` 要求 `name`；`v2` 要求 `name + email` 并移除 `legacy_id`。
+| 状态 | 请求处理 | 成功响应 |
+| --- | --- | --- |
+| `ACTIVE` 正常提供 | 正常处理 | 无附加公告 |
+| `DEPRECATED` 已废弃但仍可用 | 正常处理，兼容校验照常 | 附带废弃公告 |
+| `RETIRED` 已停止提供 | 直接拒绝，不消耗配额/幂等键 | — |
 
-## 限流语义
+废弃公告随**每个**成功响应（包括幂等回放响应）返回，内含：
 
-- 维度：按 `caller` 独立计数；算法：滑动窗口日志。
-- 窗口为半开区间 `(now - window, now]`：边界上的时间戳视为已过期，
-  窗口边界抖动不会造成漏放或重复计数。
-- 判定与计数在同一把锁内原子完成，并发请求下放行数恰好等于配额。
-- 超限拒绝为 `RATE_LIMITED`（HTTP 429），响应携带 `retry_after`
-  （同时写入 `Retry-After` 头），含义为"窗口内最早一次请求滑出窗口所需等待秒数"，
-  调用方可据此判断重试时机。
+- `sunset`：计划停止支持日期（ISO `YYYY-MM-DD`）；
+- `replacement`：建议迁移到的替代版本。
 
-## 幂等契约
+HTTP 上同时给出标准头：`Deprecation: true`、`Sunset`（UTC HTTP-date）、
+`Link: </orders?version=v2>; rel="successor-version"`；响应体内为 `deprecation` 对象。
 
-- 请求携带 `idempotency_key`；服务端对请求体计算稳定指纹（SHA-256）。
-- 首次申领：进入 `IN_PROGRESS` 并执行副作用。
-- 处理中重复申领：拒绝为 `IDEMPOTENCY_IN_PROGRESS`（HTTP 409），不重复执行。
-- 已完成重复申领：直接复用缓存结果返回（`status=replayed`），不重复执行。
-- 同一键携带不同请求体：拒绝为 `IDEMPOTENCY_CONFLICT`（HTTP 409），
-  与"处理中"明确区分。
-- 业务处理抛异常：键被释放为 `FAILED`，相同请求体可安全重试。
-- 所有状态迁移在同一把锁内完成：N 个并发相同请求中恰好 1 个获得执行权。
+版本相关失败互可区分（调用方应据此决定是"补参数"、"升级版本"还是"迁移"）：
+
+| 错误码 | HTTP | 触发条件 |
+| --- | --- | --- |
+| `MISSING_VERSION` | 400 | 未声明版本（缺字段或空串/纯空白） |
+| `INVALID_VERSION` | 400 | 版本值格式不合法（当前要求 `v<非负整数>`，如 `v1`、`v2`） |
+| `UNSUPPORTED_VERSION` | 400 | 格式合法但注册表里不认识 |
+| `VERSION_RETIRED` | 410 | 版本注册过、曾提供，现已停止（响应带替代版本指引） |
+| `INCOMPATIBLE_VERSION` | 422 | 版本可用，但请求体缺必填字段或带已移除字段 |
+
+判定优先级：先看生命周期（停用即拒绝），再做请求体形状校验——
+停用版本不会因请求体形状而被误判成 `INCOMPATIBLE_VERSION`。
+废弃版本**不豁免**兼容校验：形状不对仍是 `INCOMPATIBLE_VERSION`。
+
+内置示例：`v0` 已停用（迁往 v2）；`v1` 处于废弃期（2027-03-01 停止，迁往 v2），
+要求 `name`；`v2` 正常提供，要求 `name + email` 并移除 `legacy_id`。
+
+## 配额作用范围
+
+配额作用域是 **(caller, version) 二元组**：
+
+- 同一调用方在 `v1`、`v2` 上的额度各自独立计数，一个版本超限不影响另一版本；
+- 不同调用方即使在同一版本上也互不影响；
+- 算法为滑动窗口日志，窗口为半开区间 `(now - window, now]`，
+  边界时间戳视为已过期，窗口切换不会多放或少算；
+- 判定与计数在同一把锁内原子完成，并发放行数恰好等于配额。
+
+额度解析优先级：**特定调用方覆盖 > 版本统一额度 > 全局兜底额度**，
+由 `QuotaPolicy(default_limit, version_limits, caller_version_limits)` 配置。
+
+超限拒绝为 `RATE_LIMITED`（HTTP 429，带 `Retry-After`），结构化 `details` 携带：
+
+```json
+{
+  "scope": {"caller": "alice", "version": "v1"},
+  "limit": 5,
+  "remaining": 0,
+  "matched_rule": "caller_version"
+}
+```
+
+`matched_rule` 标明命中的规则层级（`caller_version` / `version` / `default`），
+配合 `scope` 可区分"某调用方在某版本上被单独压额"与"整个版本统一超限"；
+`retry_after` 为窗口内最早一次调用滑出所需等待秒数。
+
+> 旧的 `SlidingWindowRateLimiter`（仅按 caller）仍保留，`GatewayService`
+> 可直接装配；新链路默认使用 `ScopedSlidingWindowRateLimiter`。
+
+## 跨版本幂等契约
+
+幂等记录按 **(idempotency_key, caller, version) 三元组**隔离：
+
+- 同一键只有在**同一调用方、同一版本**下重复提交时才复用已完成结果
+  （`status=replayed`）或识别处理中（`IDEMPOTENCY_IN_PROGRESS`，HTTP 409）；
+- 换版本再用该键：视为全新操作，各自执行、各自缓存，绝不回放旧结果；
+- 换调用方再用该键：同样隔离，两个调用方的同键请求各有独立结果；
+- 同键不同请求体的 `IDEMPOTENCY_CONFLICT`（HTTP 409）只在**同一作用域内**成立；
+  跨版本/跨调用方即使请求体不同也不是冲突；
+- 业务处理抛异常：键在其作用域内释放为 `FAILED`，同作用域同请求体可安全重试，
+  不影响其他作用域；
+- 服务端对请求体计算稳定指纹（SHA-256），所有状态迁移在同一把锁内完成：
+  每个作用域的 N 个并发请求中恰好 1 个获得执行权。
 
 ## 本地验证
 
 ```bash
 uv sync                 # 安装依赖
-uv run pytest -q        # 运行全部测试（并发超限 / 重复幂等 / 版本不兼容）
+uv run pytest -q        # 全部测试：生命周期 / 跨版本配额 / 跨作用域幂等 / 并发一致性
 uv run uvicorn main:app --reload   # 本地启动服务
 ```
 
-测试日志（`gateway.service` logger）会打印请求标识、限流判定与幂等状态，例如：
+新增测试文件：
 
-```
-INFO request_id=req-7 caller=alice rate_limit allowed=False remaining=0 retry_after=59.98
-INFO request_id=req-3 idempotency_key=same-key state=IN_PROGRESS should_execute=False
-```
+- `tests/test_lifecycle.py`：三态与五类版本结论区分、废弃公告、停用不消耗配额；
+- `tests/test_quota.py`：跨版本/跨调用方配额隔离、覆盖优先级、窗口边界、并发严格性、拒绝详情；
+- `tests/test_idempotency_scope.py`：同键跨版本/跨调用方隔离、冲突作用域化、并发结论一致性。
 
-可用 `-o log_cli=true` 在 pytest 中直接观察：
+也可用 `-o log_cli=true` 在 pytest 中直接观察日志：
 
 ```bash
 uv run pytest -q -o log_cli=true --log-cli-level=INFO
@@ -77,9 +131,24 @@ uv run pytest -q -o log_cli=true --log-cli-level=INFO
 示例请求：
 
 ```bash
-curl -X POST localhost:8000/orders -H 'content-type: application/json' -d '{
+# 废弃版本：201，但响应带 Deprecation/Sunset/Link 头与 deprecation 对象
+curl -i -X POST localhost:8000/orders -H 'content-type: application/json' -d '{
   "caller": "alice", "version": "v1",
   "idempotency_key": "order-123",
   "payload": {"name": "demo"}
+}'
+
+# 停用版本：410 VERSION_RETIRED，details 指向替代版本
+curl -i -X POST localhost:8000/orders -H 'content-type: application/json' -d '{
+  "caller": "alice", "version": "v0",
+  "idempotency_key": "order-124",
+  "payload": {"name": "demo"}
+}'
+
+# 迁移到正常版本 v2
+curl -X POST localhost:8000/orders -H 'content-type: application/json' -d '{
+  "caller": "alice", "version": "v2",
+  "idempotency_key": "order-125",
+  "payload": {"name": "demo", "email": "demo@example.com"}
 }'
 ```

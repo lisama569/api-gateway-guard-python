@@ -7,6 +7,12 @@
 - 同一幂等键对应不同的请求指纹（fingerprint）即标识冲突，
   抛出 IDEMPOTENCY_CONFLICT，与"处理中"明确区分。
 - 所有状态迁移在同一把锁内完成，并发下不会重复触发副作用。
+
+跨版本 / 跨调用方隔离：
+- 幂等作用域为 (idempotency_key, caller, version) 三元组。
+- 同一幂等键只有在同一调用方、同一接口版本下重复提交时才复用结果或
+  识别处理中；换版本或换调用方再用该键视为全新操作，不回放旧结果，
+  也不会把不同作用域的请求误判成冲突。
 """
 
 from __future__ import annotations
@@ -44,17 +50,36 @@ class _Record:
 
 
 class IdempotencyStore:
-    """幂等键存储：申领、完成、失败释放。"""
+    """幂等键存储：申领、完成、失败释放。
+
+    记录按 (key, caller, version) 三元组隔离；未显式传作用域时
+    统一落到默认作用域，保持旧调用方行为不变。
+    """
+
+    #: 未显式声明作用域时使用的占位作用域。
+    DEFAULT_SCOPE = ("*", "*")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._records: dict[str, _Record] = {}
+        self._records: dict[tuple[str, str, str], _Record] = {}
 
-    def claim(self, key: str, fingerprint: str) -> IdempotencyClaim:
+    @classmethod
+    def _scoped(cls, key: str, caller: str, version: str) -> tuple[str, str, str]:
+        return (key, caller, version)
+
+    def claim(
+        self,
+        key: str,
+        fingerprint: str,
+        *,
+        caller: str = DEFAULT_SCOPE[0],
+        version: str = DEFAULT_SCOPE[1],
+    ) -> IdempotencyClaim:
         with self._lock:
-            rec = self._records.get(key)
+            scoped = self._scoped(key, caller, version)
+            rec = self._records.get(scoped)
             if rec is None:
-                self._records[key] = _Record(fingerprint, IdempotencyState.IN_PROGRESS)
+                self._records[scoped] = _Record(fingerprint, IdempotencyState.IN_PROGRESS)
                 return IdempotencyClaim(IdempotencyState.IN_PROGRESS, should_execute=True)
             if rec.fingerprint != fingerprint:
                 raise GatewayError(
@@ -71,25 +96,49 @@ class IdempotencyStore:
             rec.state = IdempotencyState.IN_PROGRESS
             return IdempotencyClaim(IdempotencyState.IN_PROGRESS, should_execute=True)
 
-    def complete(self, key: str, fingerprint: str, result: Any) -> None:
+    def complete(
+        self,
+        key: str,
+        fingerprint: str,
+        result: Any,
+        *,
+        caller: str = DEFAULT_SCOPE[0],
+        version: str = DEFAULT_SCOPE[1],
+    ) -> None:
         with self._lock:
-            rec = self._require_owned(key, fingerprint)
+            rec = self._require_owned(key, fingerprint, caller, version)
             rec.state = IdempotencyState.COMPLETED
             rec.result = result
 
-    def fail(self, key: str, fingerprint: str) -> None:
+    def fail(
+        self,
+        key: str,
+        fingerprint: str,
+        *,
+        caller: str = DEFAULT_SCOPE[0],
+        version: str = DEFAULT_SCOPE[1],
+    ) -> None:
         """标记处理失败，释放该键以允许后续安全重试。"""
         with self._lock:
-            rec = self._require_owned(key, fingerprint)
+            rec = self._require_owned(key, fingerprint, caller, version)
             rec.state = IdempotencyState.FAILED
 
-    def state_of(self, key: str) -> IdempotencyState | None:
+    def state_of(
+        self,
+        key: str,
+        *,
+        caller: str = DEFAULT_SCOPE[0],
+        version: str = DEFAULT_SCOPE[1],
+    ) -> IdempotencyState | None:
         with self._lock:
-            rec = self._records.get(key)
+            rec = self._records.get(self._scoped(key, caller, version))
             return rec.state if rec else None
 
-    def _require_owned(self, key: str, fingerprint: str) -> _Record:
-        rec = self._records.get(key)
+    def _require_owned(
+        self, key: str, fingerprint: str, caller: str, version: str
+    ) -> _Record:
+        scoped = self._scoped(key, caller, version)
+        rec = self._records.get(scoped)
         if rec is None:
             raise GatewayError(ErrorCode.IDEMPOTENCY_CONFLICT, f"unknown idempotency key {key!r}")
         if rec.fingerprint != fingerprint:
