@@ -11,7 +11,11 @@ import enum
 class ErrorCode(enum.Enum):
     """网关可区分错误码。"""
 
+    # 版本相关：以下五种结论必须互可区分
+    VERSION_MISSING = "VERSION_MISSING"
+    VERSION_MALFORMED = "VERSION_MALFORMED"
     UNSUPPORTED_VERSION = "UNSUPPORTED_VERSION"
+    VERSION_RETIRED = "VERSION_RETIRED"
     INCOMPATIBLE_VERSION = "INCOMPATIBLE_VERSION"
     RATE_LIMITED = "RATE_LIMITED"
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
@@ -21,8 +25,19 @@ class ErrorCode(enum.Enum):
 class GatewayError(Exception):
     """网关治理层拒绝请求时抛出的异常。"""
 
-    def __init__(self, code: ErrorCode, message: str, *, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        remaining: int | None = None,
+        scope: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retry_after = retry_after
+        # 限流命中时附带：剩余可用次数与命中的配额范围（version/caller）
+        self.remaining = remaining
+        self.scope = scope

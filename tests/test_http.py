@@ -59,3 +59,50 @@ def test_idempotency_conflict_is_409():
     assert r1.status_code == 201
     assert r2.status_code == 409
     assert r2.json()["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_retired_version_returns_410():
+    c = client()
+    r = c.post("/orders", json=order(version="v0", key="http-k7", payload={}))
+    assert r.status_code == 410
+    assert r.json()["code"] == "VERSION_RETIRED"
+    assert "v2" in r.json()["message"]
+
+
+def test_missing_version_returns_400():
+    c = client()
+    body = {"caller": "alice", "idempotency_key": "http-k8", "payload": {"name": "n"}}
+    r = c.post("/orders", json=body)
+    assert r.status_code == 400
+    assert r.json()["code"] == "VERSION_MISSING"
+
+
+def test_malformed_version_returns_400():
+    c = client()
+    r = c.post("/orders", json=order(version="V1", key="http-k9"))
+    assert r.status_code == 400
+    assert r.json()["code"] == "VERSION_MALFORMED"
+
+
+def test_deprecated_version_returns_warning():
+    c = client()
+    service._idempotency.__init__()
+    r = c.post("/orders", json=order(version="v1", caller="depr", key="http-k10"))
+    assert r.status_code == 201
+    warnings = r.json()["warnings"]
+    assert len(warnings) == 1
+    assert warnings[0]["status"] == "DEPRECATED"
+    assert warnings[0]["successor"] == "v2"
+    assert warnings[0]["sunset_on"] == "2027-03-01"
+
+
+def test_cross_version_same_key_not_replayed():
+    c = client()
+    service._idempotency.__init__()
+    r1 = c.post("/orders", json=order(version="v1", caller="xv", key="http-k11",
+                                      payload={"name": "a"}))
+    r2 = c.post("/orders", json=order(version="v2", caller="xv", key="http-k11",
+                                      payload={"name": "a", "email": "e@x"}))
+    assert r1.status_code == 201 and r1.json()["status"] == "executed"
+    assert r2.status_code == 201 and r2.json()["status"] == "executed"
+    assert r2.json()["result"] != r1.json()["result"]

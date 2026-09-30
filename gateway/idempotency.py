@@ -7,6 +7,13 @@
 - 同一幂等键对应不同的请求指纹（fingerprint）即标识冲突，
   抛出 IDEMPOTENCY_CONFLICT，与"处理中"明确区分。
 - 所有状态迁移在同一把锁内完成，并发下不会重复触发副作用。
+
+跨版本/跨调用方隔离：
+- 通过 scope(caller, version) 获得作用域视图；幂等标识只在
+  "同一调用方 + 同一接口版本"作用域内有意义。
+- 换版本或换调用方复用同一标识是互不相关的两笔操作：
+  不会回放旧结果、不会误判处理中，也不会误判冲突。
+- 失败后的安全重试同样只在相同作用域内允许。
 """
 
 from __future__ import annotations
@@ -17,6 +24,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from gateway.errors import ErrorCode, GatewayError
+
+# 键作用域内部分隔符（ASCII US），不会出现在正常调用方/版本标识中
+_SCOPE_SEP = "\x1f"
 
 
 class IdempotencyState(enum.Enum):
@@ -88,6 +98,10 @@ class IdempotencyStore:
             rec = self._records.get(key)
             return rec.state if rec else None
 
+    def scope(self, caller: str, version: str) -> ScopedIdempotencyView:
+        """返回绑定 (caller, version) 作用域的幂等视图。"""
+        return ScopedIdempotencyView(self, IdempotencyScope(caller, version))
+
     def _require_owned(self, key: str, fingerprint: str) -> _Record:
         rec = self._records.get(key)
         if rec is None:
@@ -98,3 +112,35 @@ class IdempotencyStore:
                 f"idempotency key {key!r} reused with a different request",
             )
         return rec
+
+
+@dataclass(frozen=True)
+class IdempotencyScope:
+    """幂等作用域：同一调用方 + 同一接口版本。"""
+
+    caller: str
+    version: str
+
+    def qualify(self, key: str) -> str:
+        """把业务幂等键映射为作用域内的存储键，不同作用域必然不同。"""
+        return f"{self.caller}{_SCOPE_SEP}{self.version}{_SCOPE_SEP}{key}"
+
+
+class ScopedIdempotencyView:
+    """绑定 (caller, version) 作用域的幂等视图，接口与 IdempotencyStore 键级 API 一致。"""
+
+    def __init__(self, store: IdempotencyStore, scope: IdempotencyScope) -> None:
+        self._store = store
+        self.scope = scope
+
+    def claim(self, key: str, fingerprint: str) -> IdempotencyClaim:
+        return self._store.claim(self.scope.qualify(key), fingerprint)
+
+    def complete(self, key: str, fingerprint: str, result: Any) -> None:
+        self._store.complete(self.scope.qualify(key), fingerprint, result)
+
+    def fail(self, key: str, fingerprint: str) -> None:
+        self._store.fail(self.scope.qualify(key), fingerprint)
+
+    def state_of(self, key: str) -> IdempotencyState | None:
+        return self._store.state_of(self.scope.qualify(key))
