@@ -30,14 +30,20 @@ logger = logging.getLogger("gateway.service")
 
 @dataclass(frozen=True)
 class GatewayRequest:
-    """进入网关的统一请求。"""
+    """进入网关的统一请求。
+
+    位置参数顺序自首个版本起固定为
+    ``(request_id, caller, version, idempotency_key, payload)``，
+    属于对外契约，后续字段只能在末尾追加，不能调整既有顺序；
+    既有调用方按位置传参的写法必须继续可用。
+    """
 
     request_id: str
     caller: str
+    #: 未声明版本时传 None，由版本解析环节给出 MISSING_VERSION 结论。
+    version: str | None
     idempotency_key: str
     payload: dict
-    #: 未声明版本时为 None，由版本解析环节给出 MISSING_VERSION 结论。
-    version: str | None = None
 
 
 @dataclass(frozen=True)

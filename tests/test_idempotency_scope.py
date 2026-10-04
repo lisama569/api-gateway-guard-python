@@ -252,7 +252,7 @@ def test_concurrent_same_key_across_three_scopes_each_executes_once(service):
         scope = (caller, version)
         try:
             resp = service.handle(
-                GatewayRequest("r", caller, "same-key", payload, version=version),
+                GatewayRequest(request_id="r", caller=caller, version=version, idempotency_key="same-key", payload=payload),
                 handler,
             )
             with lock:

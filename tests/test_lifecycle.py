@@ -72,7 +72,7 @@ def test_deprecated_version_still_served_and_carries_notice(registry):
     # 废弃版本仍能正常处理请求，成功响应上带迁移公告
     svc = make_service(registry)
     resp = svc.handle(
-        GatewayRequest("r1", "alice", "k1", {"name": "a"}, version="v1"),
+        GatewayRequest(request_id="r1", caller="alice", version="v1", idempotency_key="k1", payload={"name": "a"}),
         lambda p: {"ok": True},
     )
     assert resp.status == "executed"
@@ -80,7 +80,7 @@ def test_deprecated_version_still_served_and_carries_notice(registry):
     assert resp.deprecation.replacement == "v2"
     # 复用缓存结果的响应同样带公告
     replay = svc.handle(
-        GatewayRequest("r2", "alice", "k1", {"name": "a"}, version="v1"),
+        GatewayRequest(request_id="r2", caller="alice", version="v1", idempotency_key="k1", payload={"name": "a"}),
         lambda p: {"ok": True},
     )
     assert replay.status == "replayed"
@@ -165,7 +165,7 @@ def test_retired_version_does_not_consume_quota_or_idempotency(registry):
         svc.handle(req("v0", key="k"), lambda p: p)
     # 停用拒绝不占用幂等键：同键在 v1 上是全新操作
     resp = svc.handle(
-        GatewayRequest("r", "alice", "k", {"name": "a"}, version="v1"),
+        GatewayRequest(request_id="r", caller="alice", version="v1", idempotency_key="k", payload={"name": "a"}),
         lambda p: "fresh",
     )
     assert isinstance(resp, GatewayResponse)

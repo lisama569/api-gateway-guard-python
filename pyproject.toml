@@ -9,6 +9,12 @@ dependencies = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+addopts = "-v"
+# 实时输出测试日志：能看出覆盖了哪些业务面、每类业务的用例与结论
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(levelname)-5s %(name)s | %(message)s"
+log_cli_date_format = "%H:%M:%S"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"

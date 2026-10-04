@@ -27,6 +27,59 @@ tests/            # 单元、端到端与并发测试
 → 执行业务 → 完成/失败登记**。任一环节拒绝都不会进入后续环节
 （版本被停用/不兼容不消耗配额、不占用幂等键）。
 
+## 调用约定与兼容性要求
+
+`GatewayRequest` 的位置参数顺序自首个版本起固定为：
+
+```python
+GatewayRequest(request_id, caller, version, idempotency_key, payload)
+```
+
+这是对外契约：**既有调用方不改代码即可继续使用**——升级前按位置传参构造的
+请求，升级后照旧走完版本校验、配额判定、幂等处理与业务执行，结论只取决于
+请求内容本身，与构造写法无关。后续如需扩展字段，只能在末尾追加并保持
+既有顺序不变。未声明版本时显式传 `version=None`，由网关给出
+`MISSING_VERSION` 结论。
+
+同一份请求内容，以下等价写法结论完全一致（执行还是回放、拒绝时的错误码、
+命中的配额范围与幂等作用域都相同，并发下也一样）：
+
+```python
+# 既有写法：全部按位置传参（升级前就在用，继续有效）
+GatewayRequest("r1", "alice", "v2", "order-123", {"name": "a", "email": "a@x"})
+
+# 按参数名逐个传递
+GatewayRequest(request_id="r1", caller="alice", version="v2",
+               idempotency_key="order-123", payload={"name": "a", "email": "a@x"})
+
+# 混合写法
+GatewayRequest("r1", "alice", version="v2",
+               idempotency_key="order-123", payload={"name": "a", "email": "a@x"})
+```
+
+从 HTTP 入口（`POST /orders`）进入与直接调用 `GatewayService.handle`
+结论同样一致：HTTP 请求体按参数名映射到 `GatewayRequest`，命中同一份
+配额作用域与幂等作用域。
+
+## 失败边界
+
+以下五类版本失败各自给出稳定、互可区分的结论，**不因调用写法或入口而变化**，
+且被拒绝的请求不会进入业务处理、不消耗配额、不占用幂等键
+（调用方应据此决定是"补参数"、"修正版本值"还是"迁移版本"）：
+
+| 错误码 | HTTP | 触发条件 |
+| --- | --- | --- |
+| `MISSING_VERSION` | 400 | 未声明版本（缺字段或空串/纯空白） |
+| `INVALID_VERSION` | 400 | 版本值格式不合法（当前要求 `v<非负整数>`，如 `v1`、`v2`） |
+| `UNSUPPORTED_VERSION` | 400 | 格式合法但注册表里不认识 |
+| `VERSION_RETIRED` | 410 | 版本注册过、曾提供，现已停止（响应带替代版本指引） |
+| `INCOMPATIBLE_VERSION` | 422 | 版本可用，但请求体缺必填字段或带已移除字段 |
+
+判定优先级：先看生命周期（停用即拒绝），再做请求体形状校验——
+停用版本不会因请求体形状而被误判成 `INCOMPATIBLE_VERSION`，
+也**不会为了兼容而重新放行**；废弃版本**不豁免**兼容校验，
+形状不对仍是 `INCOMPATIBLE_VERSION`。
+
 ## 版本生命周期规则
 
 每个版本注册时声明一种状态：
@@ -44,20 +97,6 @@ tests/            # 单元、端到端与并发测试
 
 HTTP 上同时给出标准头：`Deprecation: true`、`Sunset`（UTC HTTP-date）、
 `Link: </orders?version=v2>; rel="successor-version"`；响应体内为 `deprecation` 对象。
-
-版本相关失败互可区分（调用方应据此决定是"补参数"、"升级版本"还是"迁移"）：
-
-| 错误码 | HTTP | 触发条件 |
-| --- | --- | --- |
-| `MISSING_VERSION` | 400 | 未声明版本（缺字段或空串/纯空白） |
-| `INVALID_VERSION` | 400 | 版本值格式不合法（当前要求 `v<非负整数>`，如 `v1`、`v2`） |
-| `UNSUPPORTED_VERSION` | 400 | 格式合法但注册表里不认识 |
-| `VERSION_RETIRED` | 410 | 版本注册过、曾提供，现已停止（响应带替代版本指引） |
-| `INCOMPATIBLE_VERSION` | 422 | 版本可用，但请求体缺必填字段或带已移除字段 |
-
-判定优先级：先看生命周期（停用即拒绝），再做请求体形状校验——
-停用版本不会因请求体形状而被误判成 `INCOMPATIBLE_VERSION`。
-废弃版本**不豁免**兼容校验：形状不对仍是 `INCOMPATIBLE_VERSION`。
 
 内置示例：`v0` 已停用（迁往 v2）；`v1` 处于废弃期（2027-03-01 停止，迁往 v2），
 要求 `name`；`v2` 正常提供，要求 `name + email` 并移除 `legacy_id`。
@@ -112,21 +151,32 @@ HTTP 上同时给出标准头：`Deprecation: true`、`Sunset`（UTC HTTP-date�
 
 ```bash
 uv sync                 # 安装依赖
-uv run pytest -q        # 全部测试：生命周期 / 跨版本配额 / 跨作用域幂等 / 并发一致性
+uv run pytest           # 全部测试：默认 -v 并实时输出日志，
+                        # 能看出每个用例覆盖的业务面与结论
 uv run uvicorn main:app --reload   # 本地启动服务
 ```
 
-新增测试文件：
+测试文件：
 
+- `tests/test_call_compat.py`：调用写法兼容性回归——既有位置传参与等价写法
+  结论一致；五类失败边界与写法无关；跨版本/跨调用方配额与幂等隔离；
+  并发下结论一致；HTTP 入口与直接调用入口等价；
 - `tests/test_lifecycle.py`：三态与五类版本结论区分、废弃公告、停用不消耗配额；
 - `tests/test_quota.py`：跨版本/跨调用方配额隔离、覆盖优先级、窗口边界、并发严格性、拒绝详情；
-- `tests/test_idempotency_scope.py`：同键跨版本/跨调用方隔离、冲突作用域化、并发结论一致性。
+- `tests/test_idempotency_scope.py`：同键跨版本/跨调用方隔离、冲突作用域化、并发结论一致性；
+- `tests/test_http.py`：错误码到 HTTP 状态的映射、废弃/停用响应头、配额拒绝详情。
 
-也可用 `-o log_cli=true` 在 pytest 中直接观察日志：
+测试日志按业务面分组输出（`A 构造兼容` / `B 失败边界` / `C 配额隔离` /
+`D 幂等隔离` / `E 并发一致` / `F 入口等价`），例如：
 
-```bash
-uv run pytest -q -o log_cli=true --log-cli-level=INFO
 ```
+tests/test_call_compat.py::test_legacy_positional_request_flows_through_whole_pipeline
+INFO tests.call_compat | A 构造兼容 | 位置写法走完全流程 | status=executed calls=1
+tests/test_call_compat.py::test_rejection_conclusion_is_builder_independent[retired-build_positional]
+INFO tests.call_compat | B 失败边界 | build_positional | retired -> VERSION_RETIRED（业务未执行）
+```
+
+如需静默运行：`uv run pytest -q -p no:cacheprovider -o addopts="" -o log_cli=false`。
 
 示例请求：
 
