@@ -27,6 +27,36 @@ tests/            # 单元、端到端与并发测试
 → 执行业务 → 完成/失败登记**。任一环节拒绝都不会进入后续环节
 （版本被停用/不兼容不消耗配额、不占用幂等键）。
 
+## 调用约定与兼容性
+
+`GatewayRequest` 的规范构造方式是**按参数名传参**：
+
+```python
+GatewayRequest(
+    request_id="r-1", caller="alice", version="v2",
+    idempotency_key="order-123", payload={"name": "a", "email": "a@x"},
+)
+```
+
+**既有调用方无需改代码**：治理层升级前的位置参数写法
+`GatewayRequest(rid, caller, version, idempotency_key, payload)` 仍然可用，
+构造时会按槽位类型归一化为同一请求对象。兼容性承诺：
+
+- 同一份请求内容，无论用旧位置写法、新位置写法还是关键字写法构造，
+  归一化后字段完全一致，后续版本校验、配额判定、幂等申领、业务执行的
+  结论（放行/回放/拒绝及拒绝原因）完全相同，并发下也一致；
+- 两种写法落在**同一个** `(caller, version)` 配额作用域与
+  `(key, caller, version)` 幂等作用域内：老写法消耗的额度新写法同样受限，
+  老写法执行过的键新写法提交会回放；
+- 拒绝结论只取决于请求内容本身（缺失/非法/不认识/已停用/不兼容），
+  与构造写法无关；
+- 位置参数歧义（如槽位类型对不上两种顺序）会在构造期抛 `TypeError`，
+  不会静默错配；同一槽位位置与关键字混传给两遍也会抛 `TypeError`。
+
+HTTP 入口（`POST /orders`）的 JSON 体字段与 `GatewayRequest` 一一对应，
+`version` 可缺省（缺省即 `MISSING_VERSION` 结论），从 HTTP 入口与直接
+调用 `GatewayService` 的结论一致。
+
 ## 版本生命周期规则
 
 每个版本注册时声明一种状态：
@@ -113,14 +143,19 @@ HTTP 上同时给出标准头：`Deprecation: true`、`Sunset`（UTC HTTP-date�
 ```bash
 uv sync                 # 安装依赖
 uv run pytest -q        # 全部测试：生命周期 / 跨版本配额 / 跨作用域幂等 / 并发一致性
+uv run pytest -v        # 逐条列出每个业务文件下的用例与结果（PASSED/FAILED）
 uv run uvicorn main:app --reload   # 本地启动服务
 ```
 
-新增测试文件：
+测试文件与覆盖面对应关系：
 
+- `tests/test_compat.py`：调用写法兼容性回归——旧位置写法与关键字写法
+  构造归一、成功/回放/五类失败分支结论一致、配额与幂等作用域跨写法共享、
+  并发混发结论不分裂；
 - `tests/test_lifecycle.py`：三态与五类版本结论区分、废弃公告、停用不消耗配额；
 - `tests/test_quota.py`：跨版本/跨调用方配额隔离、覆盖优先级、窗口边界、并发严格性、拒绝详情；
-- `tests/test_idempotency_scope.py`：同键跨版本/跨调用方隔离、冲突作用域化、并发结论一致性。
+- `tests/test_idempotency_scope.py`：同键跨版本/跨调用方隔离、冲突作用域化、并发结论一致性；
+- `tests/test_http.py`：HTTP 入口的错误码→状态映射、废弃响应头、作用域化拒绝体。
 
 也可用 `-o log_cli=true` 在 pytest 中直接观察日志：
 

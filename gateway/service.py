@@ -27,10 +27,19 @@ from gateway.versioning import DeprecationNotice, VersionRegistry
 
 logger = logging.getLogger("gateway.service")
 
+#: 位置参数未覆盖某槽位时的哨兵（区别于显式传 None 的 version）。
+_UNSET: Any = object()
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, init=False)
 class GatewayRequest:
-    """进入网关的统一请求。"""
+    """进入网关的统一请求。
+
+    构造兼容两种写法，同一份请求内容结论一致：
+    - 升级前的既有位置写法：``GatewayRequest(rid, caller, version, key, payload)``
+    - 升级后的关键字写法：``GatewayRequest(request_id=..., caller=..., ...)``
+      （也接受新位置顺序 ``(rid, caller, key, payload[, version])``）
+    """
 
     request_id: str
     caller: str
@@ -38,6 +47,68 @@ class GatewayRequest:
     payload: dict
     #: 未声明版本时为 None，由版本解析环节给出 MISSING_VERSION 结论。
     version: str | None = None
+
+    def __init__(
+        self,
+        request_id: str,
+        caller: str,
+        *args: Any,
+        version: str | None = None,
+        idempotency_key: str | None = None,
+        payload: dict | None = None,
+    ) -> None:
+        if args:
+            pos_version, pos_key, pos_payload = self._parse_positional(args)
+            # 关键字只允许补位置参数没给的槽位；同一槽位给两遍属于调用错误。
+            if pos_version is not _UNSET and version is not None:
+                raise TypeError("GatewayRequest got version both positionally and by keyword")
+            if pos_key is not _UNSET and idempotency_key is not None:
+                raise TypeError(
+                    "GatewayRequest got idempotency_key both positionally and by keyword"
+                )
+            if pos_payload is not _UNSET and payload is not None:
+                raise TypeError("GatewayRequest got payload both positionally and by keyword")
+            if pos_version is not _UNSET:
+                version = pos_version
+            if pos_key is not _UNSET:
+                idempotency_key = pos_key
+            if pos_payload is not _UNSET:
+                payload = pos_payload
+        if idempotency_key is None or payload is None:
+            raise TypeError(
+                "GatewayRequest requires idempotency_key and payload "
+                "(positionally or by keyword)"
+            )
+        object.__setattr__(self, "request_id", request_id)
+        object.__setattr__(self, "caller", caller)
+        object.__setattr__(self, "idempotency_key", idempotency_key)
+        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "version", version)
+
+    @staticmethod
+    def _parse_positional(
+        args: tuple[Any, ...],
+    ) -> tuple[Any, Any, Any]:
+        """按槽位类型区分新旧两种位置顺序。
+
+        返回 (version, idempotency_key, payload)，未覆盖的槽位用 _UNSET 标记。
+        """
+        if len(args) == 2:  # 新顺序：(idempotency_key, payload)
+            key, payload = args
+            if isinstance(payload, dict) and not isinstance(key, dict):
+                return _UNSET, key, payload
+        elif len(args) == 3:
+            if isinstance(args[2], dict) and not isinstance(args[1], dict):
+                # 旧顺序（升级前）：(version, idempotency_key, payload)
+                return args[0], args[1], args[2]
+            if isinstance(args[1], dict) and not isinstance(args[2], dict):
+                # 新顺序：(idempotency_key, payload, version)
+                return args[2], args[0], args[1]
+        raise TypeError(
+            "GatewayRequest positional arguments are ambiguous; expected "
+            "(version, idempotency_key, payload) or (idempotency_key, payload[, version]); "
+            "prefer keyword arguments"
+        )
 
 
 @dataclass(frozen=True)
